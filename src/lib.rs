@@ -1,4 +1,5 @@
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fmt::{self, Write};
 use std::sync::{
     Arc,
@@ -6,32 +7,106 @@ use std::sync::{
     mpsc,
 };
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub type Hash = [u8; 32];
 
+pub const DEFAULT_INITIAL_REWARD: u64 = 50;
+pub const DEFAULT_HALVING_INTERVAL: u64 = 5;
+
 const EMPTY_HASH: Hash = [0; 32];
+const GENESIS_MEMO: &str = "genesis";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Transaction {
+    Reward {
+        to: String,
+        amount: u64,
+    },
+    Transfer {
+        from: String,
+        to: String,
+        amount: u64,
+    },
+    Memo(String),
+}
+
+impl Transaction {
+    pub fn reward(to: impl Into<String>, amount: u64) -> Self {
+        Self::Reward {
+            to: to.into(),
+            amount,
+        }
+    }
+
+    pub fn transfer(from: impl Into<String>, to: impl Into<String>, amount: u64) -> Self {
+        Self::Transfer {
+            from: from.into(),
+            to: to.into(),
+            amount,
+        }
+    }
+
+    pub fn memo(text: impl Into<String>) -> Self {
+        Self::Memo(text.into())
+    }
+
+    fn canonical_string(&self) -> String {
+        match self {
+            Self::Reward { to, amount } => format!("reward|{to}|{amount}"),
+            Self::Transfer { from, to, amount } => format!("transfer|{from}|{to}|{amount}"),
+            Self::Memo(text) => format!("memo|{text}"),
+        }
+    }
+}
+
+impl fmt::Display for Transaction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Reward { to, amount } => write!(f, "reward -> {to} ({amount})"),
+            Self::Transfer { from, to, amount } => write!(f, "{from} -> {to} ({amount})"),
+            Self::Memo(text) => write!(f, "memo: {text}"),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
     pub index: u64,
     pub prev_hash: Hash,
     pub merkle_root: Hash,
+    pub timestamp_secs: u64,
     pub nonce: u64,
     pub hash: Hash,
-    pub transactions: Vec<String>,
+    pub transactions: Vec<Transaction>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Blockchain {
     blocks: Vec<Block>,
     difficulty_bits: u32,
+    initial_reward: u64,
+    halving_interval: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChainError {
     InvalidDifficulty(u32),
+    InvalidRewardSchedule {
+        initial_reward: u64,
+        halving_interval: u64,
+    },
     NoWorkers,
-    InvalidBlock { index: u64, reason: &'static str },
+    InvalidBlock {
+        index: u64,
+        reason: &'static str,
+    },
+    InsufficientFunds {
+        block_index: u64,
+        account: String,
+        available: u64,
+        required: u64,
+    },
     MiningFailed,
 }
 
@@ -41,10 +116,26 @@ impl fmt::Display for ChainError {
             Self::InvalidDifficulty(bits) => {
                 write!(f, "difficulty must be between 0 and 256 bits, got {bits}")
             }
+            Self::InvalidRewardSchedule {
+                initial_reward,
+                halving_interval,
+            } => write!(
+                f,
+                "reward schedule must use a non-zero halving interval, got initial_reward={initial_reward}, halving_interval={halving_interval}"
+            ),
             Self::NoWorkers => f.write_str("mining requires at least one worker"),
             Self::InvalidBlock { index, reason } => {
                 write!(f, "block {index} is invalid: {reason}")
             }
+            Self::InsufficientFunds {
+                block_index,
+                account,
+                available,
+                required,
+            } => write!(
+                f,
+                "block {block_index} overspends account {account}: available={available}, required={required}"
+            ),
             Self::MiningFailed => f.write_str("mining finished without producing a block"),
         }
     }
@@ -54,22 +145,38 @@ impl std::error::Error for ChainError {}
 
 impl Blockchain {
     pub fn new(difficulty_bits: u32) -> Result<Self, ChainError> {
-        validate_difficulty(difficulty_bits)?;
+        Self::with_consensus(
+            difficulty_bits,
+            DEFAULT_INITIAL_REWARD,
+            DEFAULT_HALVING_INTERVAL,
+        )
+    }
 
-        let genesis_transactions = vec!["genesis".to_owned()];
+    pub fn with_consensus(
+        difficulty_bits: u32,
+        initial_reward: u64,
+        halving_interval: u64,
+    ) -> Result<Self, ChainError> {
+        validate_difficulty(difficulty_bits)?;
+        validate_reward_schedule(initial_reward, halving_interval)?;
+
+        let genesis_transactions = vec![Transaction::memo(GENESIS_MEMO)];
         let genesis_merkle_root = calculate_merkle_root(&genesis_transactions);
         let genesis = Block {
             index: 0,
             prev_hash: EMPTY_HASH,
             merkle_root: genesis_merkle_root,
+            timestamp_secs: 0,
             nonce: 0,
-            hash: calculate_hash(0, &EMPTY_HASH, &genesis_merkle_root, 0),
+            hash: calculate_hash(0, &EMPTY_HASH, &genesis_merkle_root, 0, 0),
             transactions: genesis_transactions,
         };
 
         Ok(Self {
             blocks: vec![genesis],
             difficulty_bits,
+            initial_reward,
+            halving_interval,
         })
     }
 
@@ -89,16 +196,106 @@ impl Blockchain {
         self.difficulty_bits
     }
 
+    pub fn initial_reward(&self) -> u64 {
+        self.initial_reward
+    }
+
+    pub fn halving_interval(&self) -> u64 {
+        self.halving_interval
+    }
+
     pub fn tip(&self) -> &Block {
         self.blocks
             .last()
             .expect("blockchain is always initialized with a genesis block")
     }
 
+    pub fn block_reward(&self, block_index: u64) -> u64 {
+        if block_index == 0 || self.initial_reward == 0 {
+            return 0;
+        }
+
+        let halvings = (block_index - 1) / self.halving_interval;
+        if halvings >= u64::BITS as u64 {
+            0
+        } else {
+            self.initial_reward
+                .checked_shr(halvings as u32)
+                .unwrap_or(0)
+        }
+    }
+
+    pub fn balances(&self) -> Result<HashMap<String, u64>, ChainError> {
+        self.validate_and_build_ledger()
+    }
+
+    pub fn balance_of(&self, account: &str) -> Result<u64, ChainError> {
+        Ok(self.balances()?.get(account).copied().unwrap_or(0))
+    }
+
     pub fn mine_next_block(
         &self,
-        transactions: Vec<String>,
+        miner: impl Into<String>,
+        transactions: Vec<Transaction>,
         workers: usize,
+    ) -> Result<Block, ChainError> {
+        self.mine_next_block_at_timestamp(
+            miner.into(),
+            transactions,
+            workers,
+            current_timestamp_secs(),
+        )
+    }
+
+    pub fn add_block(&mut self, block: Block) -> Result<(), ChainError> {
+        let ledger = self.validate_and_build_ledger()?;
+        validate_block_against_chain(self, self.tip(), &ledger, &block)?;
+        self.blocks.push(block);
+        Ok(())
+    }
+
+    pub fn append_mined_block(
+        &mut self,
+        miner: impl Into<String>,
+        transactions: Vec<Transaction>,
+        workers: usize,
+    ) -> Result<&Block, ChainError> {
+        let block = self.mine_next_block(miner, transactions, workers)?;
+        self.add_block(block)?;
+        Ok(self.tip())
+    }
+
+    pub fn validate(&self) -> Result<(), ChainError> {
+        self.validate_and_build_ledger().map(|_| ())
+    }
+
+    fn validate_and_build_ledger(&self) -> Result<HashMap<String, u64>, ChainError> {
+        let Some((genesis, rest)) = self.blocks.split_first() else {
+            return Err(ChainError::InvalidBlock {
+                index: 0,
+                reason: "chain is empty",
+            });
+        };
+
+        validate_genesis(genesis)?;
+        let mut previous = genesis;
+        let mut ledger = HashMap::new();
+
+        for block in rest {
+            validate_block_against_chain(self, previous, &ledger, block)?;
+            apply_transactions_to_ledger(block.index, &block.transactions, &mut ledger)?;
+            previous = block;
+        }
+
+        Ok(ledger)
+    }
+
+    fn mine_next_block_at_timestamp(
+        &self,
+        miner: String,
+        transactions: Vec<Transaction>,
+        workers: usize,
+        timestamp_secs: u64,
     ) -> Result<Block, ChainError> {
         if workers == 0 {
             return Err(ChainError::NoWorkers);
@@ -106,11 +303,16 @@ impl Blockchain {
 
         let index = self.tip().index + 1;
         let prev_hash = self.tip().hash;
-        let merkle_root = calculate_merkle_root(&transactions);
+        let transactions = Arc::new(self.prepare_block_transactions(index, miner, transactions));
+        let merkle_root = calculate_merkle_root(transactions.as_ref());
         let difficulty_bits = self.difficulty_bits;
         let found = Arc::new(AtomicBool::new(false));
-        let transactions = Arc::new(transactions);
         let (tx, rx) = mpsc::channel();
+        let ledger = self.validate_and_build_ledger()?;
+
+        validate_block_transactions(index, transactions.as_ref(), self.block_reward(index))?;
+        let mut prospective_ledger = ledger.clone();
+        apply_transactions_to_ledger(index, transactions.as_ref(), &mut prospective_ledger)?;
 
         thread::scope(|scope| {
             for worker_id in 0..workers {
@@ -121,13 +323,15 @@ impl Blockchain {
                 scope.spawn(move || {
                     let mut nonce = worker_id as u64;
                     while !found.load(Ordering::Acquire) {
-                        let hash = calculate_hash(index, &prev_hash, &merkle_root, nonce);
+                        let hash =
+                            calculate_hash(index, &prev_hash, &merkle_root, timestamp_secs, nonce);
                         if meets_difficulty(&hash, difficulty_bits) {
                             if !found.swap(true, Ordering::AcqRel) {
                                 let block = Block {
                                     index,
                                     prev_hash,
                                     merkle_root,
+                                    timestamp_secs,
                                     nonce,
                                     hash,
                                     transactions: (*transactions).clone(),
@@ -147,57 +351,45 @@ impl Blockchain {
         })
     }
 
-    pub fn add_block(&mut self, block: Block) -> Result<(), ChainError> {
-        validate_block_against_previous(self.tip(), &block, self.difficulty_bits)?;
-        self.blocks.push(block);
-        Ok(())
-    }
-
-    pub fn append_mined_block(
-        &mut self,
-        transactions: Vec<String>,
-        workers: usize,
-    ) -> Result<&Block, ChainError> {
-        let block = self.mine_next_block(transactions, workers)?;
-        self.add_block(block)?;
-        Ok(self.tip())
-    }
-
-    pub fn validate(&self) -> Result<(), ChainError> {
-        let Some((genesis, rest)) = self.blocks.split_first() else {
-            return Err(ChainError::InvalidBlock {
-                index: 0,
-                reason: "chain is empty",
-            });
-        };
-
-        validate_genesis(genesis)?;
-        let mut previous = genesis;
-        for block in rest {
-            validate_block_against_previous(previous, block, self.difficulty_bits)?;
-            previous = block;
+    fn prepare_block_transactions(
+        &self,
+        block_index: u64,
+        miner: String,
+        transactions: Vec<Transaction>,
+    ) -> Vec<Transaction> {
+        let mut prepared = Vec::with_capacity(transactions.len() + 1);
+        let reward = self.block_reward(block_index);
+        if reward > 0 {
+            prepared.push(Transaction::reward(miner, reward));
         }
-
-        Ok(())
+        prepared.extend(transactions);
+        prepared
     }
 }
 
-pub fn calculate_hash(index: u64, prev_hash: &Hash, merkle_root: &Hash, nonce: u64) -> Hash {
+pub fn calculate_hash(
+    index: u64,
+    prev_hash: &Hash,
+    merkle_root: &Hash,
+    timestamp_secs: u64,
+    nonce: u64,
+) -> Hash {
     let mut hasher = Sha256::new();
     hasher.update(index.to_le_bytes());
     hasher.update(prev_hash);
     hasher.update(merkle_root);
+    hasher.update(timestamp_secs.to_le_bytes());
     hasher.update(nonce.to_le_bytes());
     finalize_hash(hasher)
 }
 
-pub fn calculate_merkle_root(transactions: &[String]) -> Hash {
+pub fn calculate_merkle_root(transactions: &[Transaction]) -> Hash {
     let mut level: Vec<Hash> = if transactions.is_empty() {
         vec![hash_bytes(&[])]
     } else {
         transactions
             .iter()
-            .map(|transaction| hash_bytes(transaction.as_bytes()))
+            .map(|transaction| hash_bytes(transaction.canonical_string().as_bytes()))
             .collect()
     };
 
@@ -251,6 +443,17 @@ fn validate_difficulty(difficulty_bits: u32) -> Result<(), ChainError> {
     }
 }
 
+fn validate_reward_schedule(initial_reward: u64, halving_interval: u64) -> Result<(), ChainError> {
+    if halving_interval == 0 {
+        Err(ChainError::InvalidRewardSchedule {
+            initial_reward,
+            halving_interval,
+        })
+    } else {
+        Ok(())
+    }
+}
+
 fn validate_genesis(block: &Block) -> Result<(), ChainError> {
     if block.index != 0 {
         return Err(ChainError::InvalidBlock {
@@ -266,10 +469,42 @@ fn validate_genesis(block: &Block) -> Result<(), ChainError> {
         });
     }
 
+    if block.timestamp_secs != 0 {
+        return Err(ChainError::InvalidBlock {
+            index: block.index,
+            reason: "genesis block must use timestamp 0",
+        });
+    }
+
+    if block.transactions != [Transaction::memo(GENESIS_MEMO)] {
+        return Err(ChainError::InvalidBlock {
+            index: block.index,
+            reason: "genesis block transactions are fixed",
+        });
+    }
+
     validate_block_contents(block)
 }
 
-fn validate_block_against_previous(
+fn validate_block_against_chain(
+    blockchain: &Blockchain,
+    previous: &Block,
+    ledger: &HashMap<String, u64>,
+    block: &Block,
+) -> Result<(), ChainError> {
+    validate_block_header(previous, block, blockchain.difficulty_bits)?;
+    validate_block_transactions(
+        block.index,
+        &block.transactions,
+        blockchain.block_reward(block.index),
+    )?;
+
+    let mut next_ledger = ledger.clone();
+    apply_transactions_to_ledger(block.index, &block.transactions, &mut next_ledger)?;
+    Ok(())
+}
+
+fn validate_block_header(
     previous: &Block,
     block: &Block,
     difficulty_bits: u32,
@@ -288,6 +523,13 @@ fn validate_block_against_previous(
         });
     }
 
+    if block.timestamp_secs < previous.timestamp_secs {
+        return Err(ChainError::InvalidBlock {
+            index: block.index,
+            reason: "block timestamp must not move backwards",
+        });
+    }
+
     if !meets_difficulty(&block.hash, difficulty_bits) {
         return Err(ChainError::InvalidBlock {
             index: block.index,
@@ -296,6 +538,99 @@ fn validate_block_against_previous(
     }
 
     validate_block_contents(block)
+}
+
+fn validate_block_transactions(
+    block_index: u64,
+    transactions: &[Transaction],
+    expected_reward: u64,
+) -> Result<(), ChainError> {
+    if expected_reward > 0 {
+        match transactions.first() {
+            Some(Transaction::Reward { to, amount })
+                if !to.is_empty() && *amount == expected_reward => {}
+            Some(Transaction::Reward { .. }) => {
+                return Err(ChainError::InvalidBlock {
+                    index: block_index,
+                    reason: "block reward amount does not match the halving schedule",
+                });
+            }
+            _ => {
+                return Err(ChainError::InvalidBlock {
+                    index: block_index,
+                    reason: "first transaction must be the block reward",
+                });
+            }
+        }
+    } else if transactions
+        .iter()
+        .any(|transaction| matches!(transaction, Transaction::Reward { .. }))
+    {
+        return Err(ChainError::InvalidBlock {
+            index: block_index,
+            reason: "reward transactions are not allowed once rewards reach zero",
+        });
+    }
+
+    for transaction in transactions {
+        match transaction {
+            Transaction::Reward { to, amount } => {
+                if to.is_empty() {
+                    return Err(ChainError::InvalidBlock {
+                        index: block_index,
+                        reason: "reward transactions require a miner address",
+                    });
+                }
+                if *amount == 0 {
+                    return Err(ChainError::InvalidBlock {
+                        index: block_index,
+                        reason: "reward transactions must have a non-zero amount",
+                    });
+                }
+            }
+            Transaction::Transfer { from, to, amount } => {
+                if from.is_empty() || to.is_empty() {
+                    return Err(ChainError::InvalidBlock {
+                        index: block_index,
+                        reason: "transfer participants must not be empty",
+                    });
+                }
+                if from == to {
+                    return Err(ChainError::InvalidBlock {
+                        index: block_index,
+                        reason: "transfer sender and recipient must differ",
+                    });
+                }
+                if *amount == 0 {
+                    return Err(ChainError::InvalidBlock {
+                        index: block_index,
+                        reason: "transfer amounts must be non-zero",
+                    });
+                }
+            }
+            Transaction::Memo(text) => {
+                if text.trim().is_empty() {
+                    return Err(ChainError::InvalidBlock {
+                        index: block_index,
+                        reason: "memo transactions must not be blank",
+                    });
+                }
+            }
+        }
+    }
+
+    if transactions
+        .iter()
+        .skip(1)
+        .any(|transaction| matches!(transaction, Transaction::Reward { .. }))
+    {
+        return Err(ChainError::InvalidBlock {
+            index: block_index,
+            reason: "block rewards must appear before all other transactions",
+        });
+    }
+
+    Ok(())
 }
 
 fn validate_block_contents(block: &Block) -> Result<(), ChainError> {
@@ -311,6 +646,7 @@ fn validate_block_contents(block: &Block) -> Result<(), ChainError> {
         block.index,
         &block.prev_hash,
         &block.merkle_root,
+        block.timestamp_secs,
         block.nonce,
     );
     if block.hash != expected_hash {
@@ -318,6 +654,50 @@ fn validate_block_contents(block: &Block) -> Result<(), ChainError> {
             index: block.index,
             reason: "block hash does not match the block contents",
         });
+    }
+
+    Ok(())
+}
+
+fn apply_transactions_to_ledger(
+    block_index: u64,
+    transactions: &[Transaction],
+    ledger: &mut HashMap<String, u64>,
+) -> Result<(), ChainError> {
+    for transaction in transactions {
+        match transaction {
+            Transaction::Reward { to, amount } => {
+                let balance = ledger.entry(to.clone()).or_default();
+                *balance = balance
+                    .checked_add(*amount)
+                    .ok_or(ChainError::InvalidBlock {
+                        index: block_index,
+                        reason: "account balance overflowed",
+                    })?;
+            }
+            Transaction::Transfer { from, to, amount } => {
+                let available = ledger.get(from).copied().unwrap_or(0);
+                if available < *amount {
+                    return Err(ChainError::InsufficientFunds {
+                        block_index,
+                        account: from.clone(),
+                        available,
+                        required: *amount,
+                    });
+                }
+
+                ledger.insert(from.clone(), available - amount);
+                let recipient_balance = ledger.entry(to.clone()).or_default();
+                *recipient_balance =
+                    recipient_balance
+                        .checked_add(*amount)
+                        .ok_or(ChainError::InvalidBlock {
+                            index: block_index,
+                            reason: "account balance overflowed",
+                        })?;
+            }
+            Transaction::Memo(_) => {}
+        }
     }
 
     Ok(())
@@ -343,6 +723,12 @@ fn finalize_hash(hasher: Sha256) -> Hash {
     hash
 }
 
+fn current_timestamp_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,37 +748,135 @@ mod tests {
     #[test]
     fn rejects_zero_workers() {
         let chain = Blockchain::new(4).unwrap();
-        let error = chain.mine_next_block(vec!["tx".into()], 0).unwrap_err();
+        let error = chain
+            .mine_next_block("alice", vec![Transaction::memo("warmup")], 0)
+            .unwrap_err();
         assert_eq!(error, ChainError::NoWorkers);
     }
 
     #[test]
-    fn appends_valid_blocks_and_validates_the_chain() {
-        let mut chain = Blockchain::new(8).unwrap();
+    fn appends_valid_blocks_tracks_balances_and_validates_chain() {
+        let mut chain = Blockchain::with_consensus(8, 50, 2).unwrap();
         chain
-            .append_mined_block(vec!["alice->bob:5".into(), "bob->carol:1".into()], 2)
+            .append_mined_block("alice", vec![Transaction::memo("boot")], 2)
             .unwrap();
         chain
-            .append_mined_block(vec!["carol->dave:1".into()], 2)
+            .append_mined_block("bob", vec![Transaction::transfer("alice", "bob", 20)], 2)
+            .unwrap();
+        chain
+            .append_mined_block("alice", vec![Transaction::transfer("bob", "carol", 10)], 2)
             .unwrap();
 
-        assert_eq!(chain.len(), 3);
+        assert_eq!(chain.block_reward(1), 50);
+        assert_eq!(chain.block_reward(3), 25);
+        assert_eq!(chain.balance_of("alice").unwrap(), 55);
+        assert_eq!(chain.balance_of("bob").unwrap(), 60);
+        assert_eq!(chain.balance_of("carol").unwrap(), 10);
         assert!(chain.validate().is_ok());
     }
 
     #[test]
-    fn rejects_tampered_blocks() {
-        let mut chain = Blockchain::new(4).unwrap();
+    fn rejects_overspending_transfers() {
+        let chain = Blockchain::new(4).unwrap();
+        let error = chain
+            .mine_next_block("bob", vec![Transaction::transfer("alice", "bob", 1)], 1)
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            ChainError::InsufficientFunds {
+                block_index: 1,
+                account: "alice".to_owned(),
+                available: 0,
+                required: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_wrong_reward_amount() {
+        let mut chain = Blockchain::with_consensus(0, 50, 2).unwrap();
         let mut block = chain
-            .mine_next_block(vec!["alice->bob:5".into()], 2)
+            .mine_next_block_at_timestamp("alice".to_owned(), vec![Transaction::memo("boot")], 1, 1)
             .unwrap();
-        block.transactions.push("mallory->mallory:99".into());
+
+        block.transactions[0] = Transaction::reward("alice", 99);
+        block.merkle_root = calculate_merkle_root(&block.transactions);
+        block.hash = calculate_hash(
+            block.index,
+            &block.prev_hash,
+            &block.merkle_root,
+            block.timestamp_secs,
+            block.nonce,
+        );
 
         let error = chain.add_block(block).unwrap_err();
         assert_eq!(
             error,
             ChainError::InvalidBlock {
                 index: 1,
+                reason: "block reward amount does not match the halving schedule",
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_backwards_timestamps() {
+        let mut chain = Blockchain::with_consensus(0, 50, 10).unwrap();
+        let first = chain
+            .mine_next_block_at_timestamp(
+                "alice".to_owned(),
+                vec![Transaction::memo("boot")],
+                1,
+                10,
+            )
+            .unwrap();
+        chain.add_block(first).unwrap();
+
+        let mut second = chain
+            .mine_next_block_at_timestamp(
+                "bob".to_owned(),
+                vec![Transaction::transfer("alice", "bob", 5)],
+                1,
+                11,
+            )
+            .unwrap();
+        second.timestamp_secs = 9;
+        second.hash = calculate_hash(
+            second.index,
+            &second.prev_hash,
+            &second.merkle_root,
+            second.timestamp_secs,
+            second.nonce,
+        );
+
+        let error = chain.add_block(second).unwrap_err();
+        assert_eq!(
+            error,
+            ChainError::InvalidBlock {
+                index: 2,
+                reason: "block timestamp must not move backwards",
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_tampered_blocks() {
+        let mut chain = Blockchain::with_consensus(4, 50, 10).unwrap();
+        chain
+            .append_mined_block("alice", vec![Transaction::memo("boot")], 2)
+            .unwrap();
+
+        let mut block = chain
+            .mine_next_block("bob", vec![Transaction::transfer("alice", "bob", 5)], 2)
+            .unwrap();
+        block.transactions.push(Transaction::memo("tamper"));
+
+        let error = chain.add_block(block).unwrap_err();
+        assert_eq!(
+            error,
+            ChainError::InvalidBlock {
+                index: 2,
                 reason: "merkle root does not match the block transactions",
             }
         );
@@ -400,8 +884,14 @@ mod tests {
 
     #[test]
     fn merkle_root_changes_with_transaction_order() {
-        let first = calculate_merkle_root(&["a".to_owned(), "b".to_owned()]);
-        let second = calculate_merkle_root(&["b".to_owned(), "a".to_owned()]);
+        let first = calculate_merkle_root(&[
+            Transaction::memo("a"),
+            Transaction::transfer("alice", "bob", 1),
+        ]);
+        let second = calculate_merkle_root(&[
+            Transaction::transfer("alice", "bob", 1),
+            Transaction::memo("a"),
+        ]);
         assert_ne!(first, second);
     }
 }
