@@ -90,6 +90,57 @@ pub struct Blockchain {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainStats {
+    pub height: u64,
+    pub total_blocks: usize,
+    pub total_transactions: usize,
+    pub reward_transactions: usize,
+    pub transfer_transactions: usize,
+    pub memo_transactions: usize,
+    pub difficulty_bits: u32,
+    pub circulating_supply: u64,
+    pub unique_accounts: usize,
+    pub richest_account: Option<String>,
+    pub richest_balance: u64,
+    pub next_block_reward: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountActivityKind {
+    Reward,
+    Sent,
+    Received,
+}
+
+impl fmt::Display for AccountActivityKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Reward => f.write_str("reward"),
+            Self::Sent => f.write_str("sent"),
+            Self::Received => f.write_str("received"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountActivity {
+    pub block_index: u64,
+    pub kind: AccountActivityKind,
+    pub counterparty: Option<String>,
+    pub amount: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountStatement {
+    pub account: String,
+    pub balance: u64,
+    pub mined_rewards: u64,
+    pub transfers_sent: u64,
+    pub transfers_received: u64,
+    pub activity: Vec<AccountActivity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChainError {
     InvalidDifficulty(u32),
     InvalidRewardSchedule {
@@ -210,6 +261,12 @@ impl Blockchain {
             .expect("blockchain is always initialized with a genesis block")
     }
 
+    pub fn block(&self, index: u64) -> Option<&Block> {
+        self.blocks
+            .get(index as usize)
+            .filter(|block| block.index == index)
+    }
+
     pub fn block_reward(&self, block_index: u64) -> u64 {
         if block_index == 0 || self.initial_reward == 0 {
             return 0;
@@ -231,6 +288,130 @@ impl Blockchain {
 
     pub fn balance_of(&self, account: &str) -> Result<u64, ChainError> {
         Ok(self.balances()?.get(account).copied().unwrap_or(0))
+    }
+
+    pub fn top_accounts(&self, limit: usize) -> Result<Vec<(String, u64)>, ChainError> {
+        let mut balances: Vec<_> = self.balances()?.into_iter().collect();
+        balances.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        balances.truncate(limit);
+        Ok(balances)
+    }
+
+    pub fn stats(&self) -> Result<ChainStats, ChainError> {
+        let balances = self.validate_and_build_ledger()?;
+        let mut reward_transactions = 0usize;
+        let mut transfer_transactions = 0usize;
+        let mut memo_transactions = 0usize;
+
+        for transaction in self
+            .blocks
+            .iter()
+            .flat_map(|block| block.transactions.iter())
+        {
+            match transaction {
+                Transaction::Reward { .. } => reward_transactions += 1,
+                Transaction::Transfer { .. } => transfer_transactions += 1,
+                Transaction::Memo(_) => memo_transactions += 1,
+            }
+        }
+
+        let circulating_supply = balances.values().try_fold(0u64, |supply, balance| {
+            supply
+                .checked_add(*balance)
+                .ok_or(ChainError::InvalidBlock {
+                    index: self.tip().index,
+                    reason: "circulating supply overflowed",
+                })
+        })?;
+
+        let (richest_account, richest_balance) = balances
+            .iter()
+            .max_by(|left, right| left.1.cmp(right.1).then_with(|| right.0.cmp(left.0)))
+            .map(|(account, balance)| (Some(account.clone()), *balance))
+            .unwrap_or((None, 0));
+
+        Ok(ChainStats {
+            height: self.tip().index,
+            total_blocks: self.blocks.len(),
+            total_transactions: reward_transactions + transfer_transactions + memo_transactions,
+            reward_transactions,
+            transfer_transactions,
+            memo_transactions,
+            difficulty_bits: self.difficulty_bits,
+            circulating_supply,
+            unique_accounts: balances.len(),
+            richest_account,
+            richest_balance,
+            next_block_reward: self.block_reward(self.tip().index + 1),
+        })
+    }
+
+    pub fn account_statement(&self, account: &str) -> Result<AccountStatement, ChainError> {
+        let balances = self.validate_and_build_ledger()?;
+        let mut mined_rewards = 0u64;
+        let mut transfers_sent = 0u64;
+        let mut transfers_received = 0u64;
+        let mut activity = Vec::new();
+
+        for block in self.blocks.iter().skip(1) {
+            for transaction in &block.transactions {
+                match transaction {
+                    Transaction::Reward { to, amount } if to == account => {
+                        mined_rewards =
+                            mined_rewards
+                                .checked_add(*amount)
+                                .ok_or(ChainError::InvalidBlock {
+                                    index: block.index,
+                                    reason: "account balance overflowed",
+                                })?;
+                        activity.push(AccountActivity {
+                            block_index: block.index,
+                            kind: AccountActivityKind::Reward,
+                            counterparty: None,
+                            amount: *amount,
+                        });
+                    }
+                    Transaction::Transfer { from, to, amount } if from == account => {
+                        transfers_sent = transfers_sent.checked_add(*amount).ok_or(
+                            ChainError::InvalidBlock {
+                                index: block.index,
+                                reason: "account balance overflowed",
+                            },
+                        )?;
+                        activity.push(AccountActivity {
+                            block_index: block.index,
+                            kind: AccountActivityKind::Sent,
+                            counterparty: Some(to.clone()),
+                            amount: *amount,
+                        });
+                    }
+                    Transaction::Transfer { from, to, amount } if to == account => {
+                        transfers_received = transfers_received.checked_add(*amount).ok_or(
+                            ChainError::InvalidBlock {
+                                index: block.index,
+                                reason: "account balance overflowed",
+                            },
+                        )?;
+                        activity.push(AccountActivity {
+                            block_index: block.index,
+                            kind: AccountActivityKind::Received,
+                            counterparty: Some(from.clone()),
+                            amount: *amount,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        Ok(AccountStatement {
+            account: account.to_owned(),
+            balance: balances.get(account).copied().unwrap_or(0),
+            mined_rewards,
+            transfers_sent,
+            transfers_received,
+            activity,
+        })
     }
 
     pub fn mine_next_block(
@@ -893,5 +1074,68 @@ mod tests {
             Transaction::memo("a"),
         ]);
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn reports_chain_stats_and_top_accounts() {
+        let mut chain = Blockchain::with_consensus(0, 50, 2).unwrap();
+        chain
+            .append_mined_block("alice", vec![Transaction::memo("boot")], 1)
+            .unwrap();
+        chain
+            .append_mined_block("bob", vec![Transaction::transfer("alice", "bob", 20)], 1)
+            .unwrap();
+
+        let stats = chain.stats().unwrap();
+        assert_eq!(stats.height, 2);
+        assert_eq!(stats.total_blocks, 3);
+        assert_eq!(stats.total_transactions, 5);
+        assert_eq!(stats.reward_transactions, 2);
+        assert_eq!(stats.transfer_transactions, 1);
+        assert_eq!(stats.memo_transactions, 2);
+        assert_eq!(stats.circulating_supply, 100);
+        assert_eq!(stats.unique_accounts, 2);
+        assert_eq!(stats.richest_account, Some("bob".to_owned()));
+        assert_eq!(stats.richest_balance, 70);
+        assert_eq!(stats.next_block_reward, 25);
+
+        assert_eq!(
+            chain.top_accounts(2).unwrap(),
+            vec![("bob".to_owned(), 70), ("alice".to_owned(), 30)]
+        );
+    }
+
+    #[test]
+    fn builds_account_statements() {
+        let mut chain = Blockchain::with_consensus(0, 50, 2).unwrap();
+        chain
+            .append_mined_block("alice", vec![Transaction::memo("boot")], 1)
+            .unwrap();
+        chain
+            .append_mined_block("bob", vec![Transaction::transfer("alice", "bob", 20)], 1)
+            .unwrap();
+
+        let statement = chain.account_statement("bob").unwrap();
+        assert_eq!(statement.balance, 70);
+        assert_eq!(statement.mined_rewards, 50);
+        assert_eq!(statement.transfers_sent, 0);
+        assert_eq!(statement.transfers_received, 20);
+        assert_eq!(
+            statement.activity,
+            vec![
+                AccountActivity {
+                    block_index: 2,
+                    kind: AccountActivityKind::Reward,
+                    counterparty: None,
+                    amount: 50,
+                },
+                AccountActivity {
+                    block_index: 2,
+                    kind: AccountActivityKind::Received,
+                    counterparty: Some("alice".to_owned()),
+                    amount: 20,
+                },
+            ]
+        );
     }
 }
